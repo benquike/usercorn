@@ -151,9 +151,19 @@ type CgcHook struct {
 	*co.KernelBase
 	Virtio map[co.Fd]io.ReadWriter
 	Name   string
+
+	Fdlock sync.Mutex
+	Fdbufs map[int]int
 }
 
 func (k *CgcHook) Transmit(fd co.Fd, buf co.Buf, size co.Len, ret co.Obuf) int {
+	/*
+		if fd > 2 {
+			k.Fdlock.Lock()
+			k.Fdbufs[(fd+1) & ^1] += size
+			k.Fdlock.Unlock()
+		}
+	*/
 	if rw, ok := k.Virtio[fd]; ok {
 		mem, err := k.U.MemRead(buf.Addr, uint64(size))
 		if err != nil {
@@ -176,6 +186,13 @@ func (k *CgcHook) Transmit(fd co.Fd, buf co.Buf, size co.Len, ret co.Obuf) int {
 }
 
 func (k *CgcHook) Receive(fd co.Fd, buf co.Obuf, size co.Len, ret co.Obuf) int {
+	/*
+		if fd > 2 {
+			k.Fdlock.Lock()
+			k.Fdbufs[(fd+1) & ^1] -= size
+			k.Fdlock.Unlock()
+		}
+	*/
 	if rw, ok := k.Virtio[fd]; ok {
 		tmp := make([]byte, size)
 		n, err := rw.Read(tmp)
@@ -200,8 +217,39 @@ func (k *CgcHook) Receive(fd co.Fd, buf co.Obuf, size co.Len, ret co.Obuf) int {
 }
 
 func (k *CgcHook) Fdwait(nfds int, reads, writes, timeoutBuf co.Buf, readyFds co.Obuf) int {
-	// Too bad.
-	return -1
+	readyFds.Pack(int32(nfds))
+	return 0
+
+	/*
+		    var readSet, writeSet *native.Fdset32
+		    var timeout native.Timespec
+		    reads.Unpack(&readSet)
+		    writes.Unpack(&writeSet)
+		    timeoutBuf.Unpack(&timeout)
+
+		    readNative := readSet.Native()
+		    writeNative := writeSet.Native()
+
+			none := true
+			for none {
+				k.Fdlock.Lock()
+				for i := 0; i < nfds; i++ {
+					if readNative.IsSet(i) && k.Fdbuf[i] > 0 {
+						any = true
+					}
+				}
+				k.Fdlock.Unlock()
+				time.Sleep(10 * time.Microsecond)
+			}
+
+		    n, err := native.Select(nfds, readNative, writeNative, &timeout)
+		    if err != nil {
+		        return -1 // FIXME?
+		    } else {
+		        readyFds.Pack(int32(n))
+		    }
+		return 0
+	*/
 }
 
 func main() {
@@ -262,7 +310,7 @@ func main() {
 			fmt.Println(err)
 			os.Exit(1)
 		}
-		cbk := &CgcHook{&co.KernelBase{}, cbio, name}
+		cbk := &CgcHook{&co.KernelBase{}, cbio, name, sync.Mutex{}, make(map[int]int)}
 		u.AddKernel(cbk, true)
 		cs = append(cs, u)
 	}
@@ -280,6 +328,11 @@ func main() {
 	secret, _ := cs[0].MemRead(secretPage, secretSize)
 	for _, u := range cs[1:] {
 		u.MemWrite(secretPage, secret)
+	}
+	for _, u := range cs {
+		for i := uint64(0); i < secretSize; i++ {
+			u.MemWrite(secretPage+i, []byte("A"))
+		}
 	}
 
 	inscount := 0
@@ -300,10 +353,11 @@ func main() {
 	if *flagtrace {
 		for i, cb := range cs {
 			name := fmt.Sprintf("CB-%d", i)
-			cb.HookAdd(uc.HOOK_MEM_READ, func(_ uc.Unicorn, access int, addr uint64, size int, val int64) {
+			cb.HookAdd(uc.HOOK_MEM_READ, func(u uc.Unicorn, access int, addr uint64, size int, val int64) {
 				if addr >= secretPage && addr <= secretPage+0x1000 {
-					eip, _ := cb.RegRead(uc.X86_REG_EIP)
-					fmt.Printf("%s: FLAG READ eip: 0x%x addr: 0x%x size: %d\n", name, eip, addr, size)
+					b, _ := u.MemRead(addr, uint64(size))
+					eip, _ := u.RegRead(uc.X86_REG_EIP)
+					fmt.Printf("%s: FLAG READ eip: 0x%x addr: 0x%x size: %d = %s\n", name, eip, addr, size, hex.EncodeToString(b))
 				}
 			}, 1, 0)
 		}
@@ -324,7 +378,7 @@ func main() {
 			fmt.Println(err)
 			os.Exit(1)
 		}
-		povk := &CgcHook{&co.KernelBase{}, make(map[co.Fd]io.ReadWriter), "POV"}
+		povk := &CgcHook{&co.KernelBase{}, make(map[co.Fd]io.ReadWriter), "POV", sync.Mutex{}, make(map[int]int)}
 		pov.AddKernel(povk, true)
 
 		// set up POV IO
@@ -350,6 +404,7 @@ func main() {
 		}
 		cbio[1] = cbio[0]
 		povk.Virtio[1] = povk.Virtio[0]
+		povk.Virtio[2] = os.Stderr
 	} else {
 		// set up STDIO
 		cbio[0] = os.Stdin
@@ -403,7 +458,9 @@ func main() {
 			for _, cb := range cs {
 				cb.Stop()
 			}
-			pov.Stop()
+			if pov != nil {
+				pov.Stop()
+			}
 			wg.Done()
 		}()
 		if len(cs) > 1 {

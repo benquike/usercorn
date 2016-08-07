@@ -135,6 +135,10 @@ func CgcInit(u models.Usercorn, args, env []string) error {
 	if _, err := rand.Read(tmp); err != nil {
 		return err
 	}
+	for i := 0x40; i < 0x80; i++ {
+		tmp[i] = 'B'
+	}
+	tmp[0x80] = 0
 	if err := u.MemWrite(secretPage, tmp); err != nil {
 		return err
 	}
